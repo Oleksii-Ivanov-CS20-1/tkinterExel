@@ -1,0 +1,1511 @@
+import tkinter as tk
+import uuid
+from tkinter import ttk, filedialog, messagebox
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+import sqlite3
+import os
+from pathlib import Path
+import datetime
+
+# ------------------------------------------------------------
+# Database helpers
+# ------------------------------------------------------------
+DB_PATH = Path("app_data.db")
+
+
+def init_db():
+    created = not DB_PATH.exists()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            password TEXT,
+            role TEXT
+        )
+        """
+    )
+
+    cur.execute("""
+        UPDATE users
+        SET skill_index = 1
+        WHERE role = 'user' AND skill_index IS NULL
+    """)
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN skill_index INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            phone TEXT UNIQUE,
+            status TEXT
+        )
+        """
+    )
+    conn.commit()
+
+    try:
+        cur.execute("ALTER TABLE contacts ADD COLUMN difficulty_index INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS contact_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER UNIQUE,
+            user_id INTEGER,
+            assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(contact_id) REFERENCES contacts(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # Create default users if they don't exist
+    cur.execute("SELECT id FROM users WHERE email = ?", ("admin@email.com",))
+    if cur.fetchone() is None:
+        cur.execute(
+            "INSERT INTO users (email, password, role) VALUES (?, ?, ?)",
+            ("admin@email.com", "admin123", "admin"),
+        )
+
+    conn.commit()
+    conn.close()
+    return created
+
+
+def verify_user(email: str, password: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, role, skill_index FROM users WHERE email = ? AND password = ?",
+        (email, password)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def load_all_users():
+    """Загружает всех пользователей из базы данных"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, email, role, skill_index 
+        FROM users 
+        ORDER BY role DESC, skill_index DESC, id ASC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def normalize_phone(value) -> str:
+    if value is None:
+        return ""
+    # Excel numbers → string without .0
+    if isinstance(value, (int, float)):
+        value = str(int(value))
+    else:
+        value = str(value)
+    value = value.strip()
+    # remove spaces, dashes etc.
+    value = value.replace(" ", "").replace("-", "")
+    return value
+
+
+def insert_contact_if_not_exists(name: str, phone: str, status: str = "", difficulty_index: int | None = None):
+    phone = normalize_phone(phone)
+    name = (name or "").strip()
+
+    if phone == "" or difficulty_index is None:
+        return False
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # explicit duplicate check (faster + safer)
+    cur.execute("SELECT id FROM contacts WHERE phone = ?", (phone,))
+    if cur.fetchone():
+        conn.close()
+        return False
+
+    cur.execute(
+        "INSERT INTO contacts (name, phone, status, difficulty_index) VALUES (?, ?, ?, ?)",
+        (name, phone, status, difficulty_index)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def load_contacts_for_admin(filter_name="", filter_phone=""):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    sql = """
+        SELECT
+            c.id,
+            c.name,
+            c.phone,
+            c.status,
+            ca.user_id
+        FROM contacts c
+        LEFT JOIN contact_assignments ca ON ca.contact_id = c.id
+        WHERE 1=1
+    """
+    params = []
+
+    if filter_name:
+        sql += " AND c.name LIKE ?"
+        params.append(f"%{filter_name}%")
+
+    if filter_phone:
+        sql += " AND c.phone LIKE ?"
+        params.append(f"%{filter_phone}%")
+
+    sql += " ORDER BY c.id DESC"
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def load_assigned_contacts_for_user(user_id: int, filter_name="", filter_phone=""):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    sql = """
+        SELECT c.id, c.name, c.phone, c.status
+        FROM contacts c
+        JOIN contact_assignments ca ON ca.contact_id = c.id
+        WHERE ca.user_id = ?
+    """
+    params = [user_id]
+
+    if filter_name:
+        sql += " AND c.name LIKE ?"
+        params.append(f"%{filter_name}%")
+
+    if filter_phone:
+        sql += " AND c.phone LIKE ?"
+        params.append(f"%{filter_phone}%")
+
+    sql += " ORDER BY ca.assigned_at"
+
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def update_contact_in_db(contact_id: int, column: str, value: str):
+    if column not in ("name", "phone", "status"):
+        return False, "Invalid column"
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    try:
+        if column == "phone":
+            # ensure uniqueness
+            cur.execute("SELECT id FROM contacts WHERE phone = ? AND id != ?", (value, contact_id))
+            if cur.fetchone():
+                return False, "Phone already exists"
+        cur.execute(f"UPDATE contacts SET {column} = ? WHERE id = ?", (value, contact_id))
+        conn.commit()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def update_contact_status(contact_id: int, status: str):
+    if status not in ("Answer", "Don't answer", "Waiting"):
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE contacts SET status = ? WHERE id = ?",
+        (status, contact_id)
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def redistribute_all_contacts():
+    PER_USER = 5
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 1. Очищаем старые назначения
+    cur.execute("DELETE FROM contact_assignments")
+
+    # 2. Получаем всех пользователей (от лучших к худшим)
+    cur.execute("""
+        SELECT id, skill_index 
+        FROM users 
+        WHERE role = 'user' 
+        ORDER BY skill_index DESC, id ASC
+    """)
+    users = cur.fetchall()
+
+    # 3. Получаем ВСЕ свободные контакты
+    cur.execute("""
+        SELECT c.id, c.difficulty_index 
+        FROM contacts c 
+        LEFT JOIN contact_assignments ca ON ca.contact_id = c.id 
+        WHERE ca.id IS NULL 
+        AND (c.status IS NULL OR c.status = '')
+        ORDER BY c.id ASC
+    """)
+    all_contacts = [(row[0], row[1]) for row in cur.fetchall()]
+
+    # Группируем контакты по difficulty_index
+    contacts_by_difficulty = {}
+    for contact_id, difficulty in all_contacts:
+        if difficulty not in contacts_by_difficulty:
+            contacts_by_difficulty[difficulty] = []
+        contacts_by_difficulty[difficulty].append(contact_id)
+
+    # 4. Распределяем контакты для каждого пользователя
+    for user_id, skill_index in users:
+        target_difficulty = 6 - skill_index
+
+        assigned_contacts = []
+
+        # Сначала пытаемся взять контакты с target_difficulty
+        if target_difficulty in contacts_by_difficulty:
+            take_count = min(PER_USER, len(contacts_by_difficulty[target_difficulty]))
+            assigned_contacts.extend(contacts_by_difficulty[target_difficulty][:take_count])
+            contacts_by_difficulty[target_difficulty] = contacts_by_difficulty[target_difficulty][take_count:]
+
+        # Если не хватило, ищем ближайшие по сложности
+        if len(assigned_contacts) < PER_USER:
+            needed = PER_USER - len(assigned_contacts)
+
+            # Ищем все оставшиеся контакты, сортируем по близости к target_difficulty
+            remaining_contacts = []
+            for diff, contact_list in contacts_by_difficulty.items():
+                for contact_id in contact_list:
+                    remaining_contacts.append((contact_id, diff, abs(diff - target_difficulty)))
+
+            # Сортируем по близости к target_difficulty
+            remaining_contacts.sort(key=lambda x: (x[2], x[1]))
+
+            # Берем нужное количество
+            for contact_id, diff, _ in remaining_contacts[:needed]:
+                assigned_contacts.append(contact_id)
+                # Удаляем взятый контакт из словаря
+                contacts_by_difficulty[diff].remove(contact_id)
+
+        # Назначаем контакты пользователю
+        for contact_id in assigned_contacts:
+            cur.execute(
+                "INSERT INTO contact_assignments (contact_id, user_id) VALUES (?, ?)",
+                (contact_id, user_id)
+            )
+
+    conn.commit()
+    conn.close()
+
+# ------------------------------------------------------------
+# Excel report saving functions
+# ------------------------------------------------------------
+def save_report_to_excel(user_email, user_name, report_data):
+    """Сохраняет отчет в Excel файл на рабочий стол"""
+    try:
+        # Получаем путь к рабочему столу
+        desktop_path = Path.home() / "Desktop"
+
+        # Создаем папку для отчетов, если её нет
+        reports_folder = desktop_path / "User_Reports"
+        reports_folder.mkdir(exist_ok=True)
+
+        # Формируем имя файла
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = reports_folder / f"Report_{user_name}_{timestamp}.xlsx"
+
+        # Создаем новую рабочую книгу
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Report"
+
+        # Стили
+        header_font = Font(name='Calibri', size=12, bold=True, color='FFFFFF')
+        header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+        header_alignment = Alignment(horizontal='center', vertical='center')
+
+        normal_font = Font(name='Calibri', size=11)
+        border = Border(left=Side(style='thin'),
+                        right=Side(style='thin'),
+                        top=Side(style='thin'),
+                        bottom=Side(style='thin'))
+
+        # 1. Заголовок отчета
+        ws.merge_cells('A1:E1')
+        title_cell = ws['A1']
+        title_cell.value = f'USER REPORT: {user_name}'
+        title_cell.font = Font(name='Calibri', size=14, bold=True)
+        title_cell.alignment = Alignment(horizontal='center')
+
+        # 2. Информация о пользователе
+        ws['A3'] = 'ser:'
+        ws['B3'] = user_name
+        ws['A4'] = 'Email:'
+        ws['B4'] = user_email
+        ws['A5'] = 'Date:'
+        ws['B5'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # 3. Статистика
+        ws['A7'] = 'STATISTICS'
+        ws['A7'].font = Font(name='Calibri', size=12, bold=True)
+
+        stats_data = [
+            ['Total contacts:', report_data['total_contacts']],
+            ['Answer:', report_data['answered']],
+            ['Do not answer:', report_data['not_answered']],
+            ['Waiting:', report_data['waiting']],
+            ['No status:', report_data['no_status']]
+        ]
+
+        for i, (label, value) in enumerate(stats_data, start=8):
+            ws[f'A{i}'] = label
+            ws[f'B{i}'] = value
+
+        # 4. Таблица контактов (начинаем с ряда 15)
+        ws['A15'] = 'CONTACTS LIST'
+        ws['A15'].font = Font(name='Calibri', size=12, bold=True)
+
+        # Заголовки таблицы
+        headers = ['№', 'Name', 'Phone', 'Status']
+        for col, header in enumerate(headers, start=1):
+            cell = ws.cell(row=16, column=col)
+            cell.value = header
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = border
+
+        # Данные контактов
+        for i, contact in enumerate(report_data['contacts'], start=1):
+            row = 16 + i
+
+            # Номер
+            ws.cell(row=row, column=1, value=i)
+
+            # Имя
+            ws.cell(row=row, column=2, value=contact['name'])
+
+            # Телефон (как текст чтобы сохранить начальные нули)
+            phone_cell = ws.cell(row=row, column=3, value=contact['phone'])
+            phone_cell.number_format = '@'  # Текстовый формат
+
+            # Статус
+            status = contact['status'] or 'No status'
+            ws.cell(row=row, column=4, value=status)
+
+            # Применяем стили ко всем ячейкам строки
+            for col in range(1, 5):
+                cell = ws.cell(row=row, column=col)
+                cell.font = normal_font
+                cell.border = border
+                if col in [1, 3]:  # Номера и телефоны по центру
+                    cell.alignment = Alignment(horizontal='center')
+                else:  # Имена и статусы по левому краю
+                    cell.alignment = Alignment(horizontal='left')
+
+        # Авто-ширина колонок
+        for column in ws.columns:
+            max_length = 0
+            column_letter = get_column_letter(column[0].column)
+
+            for cell in column:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+        # Сохраняем файл
+        wb.save(filename)
+
+        return True, str(filename)
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ------------------------------------------------------------
+# UI / App
+# ------------------------------------------------------------
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Management App")
+        self.root.geometry("800x312")
+        self.style = ttk.Style(root)
+
+        # load themes (assume files present)
+        try:
+            root.tk.call("source", "forest-light.tcl")
+            root.tk.call("source", "forest-dark.tcl")
+        except Exception:
+            # ignore if not found
+            pass
+        self.style.theme_use("forest-dark")
+
+        self.current_user = None  # (id, role)
+
+        # Main container
+        self.main_frame = ttk.Frame(root)
+        self.main_frame.pack(fill="both", expand=True)
+
+        # initialize DB
+        init_db()
+
+        # context menu for worker status change
+        self.status_menu = tk.Menu(self.root, tearoff=0)
+        self.status_menu.add_command(label="Answer", command=lambda: self._set_selected_status("Answer"))
+        self.status_menu.add_command(label="Don't answer", command=lambda: self._set_selected_status("Don't answer"))
+        self.status_menu.add_command(label="Waiting", command=lambda: self._set_selected_status("Waiting"))
+
+        self._selected_contact_id = None
+
+        self._selected_user_id = None
+
+        self.users_menu = tk.Menu(self.root, tearoff=0)
+        self.users_menu.add_command(
+            label="Delete user",
+            command=self._delete_selected_user
+        )
+
+        self.build_login_screen()
+
+    # ----------------------------
+    # Login screen
+    # ----------------------------
+    def build_login_screen(self):
+        self.root.geometry("800x312")
+
+        for w in self.main_frame.winfo_children():
+            w.destroy()
+
+        login_frame = ttk.Frame(self.main_frame)
+        login_frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        box = ttk.Labelframe(login_frame, text="Login", padding=16)
+        box.grid(row=0, column=0)
+
+        self.email_entry = ttk.Entry(box, width=30)
+        self.email_entry.insert(0, "Email")
+        self.email_entry.bind("<FocusIn>", lambda e: self._clear_placeholder(self.email_entry, "Email"))
+        self.email_entry.grid(row=0, column=0, padx=8, pady=(6, 6))
+
+        self.pass_entry = ttk.Entry(box, show="*", width=30)
+        self.pass_entry.insert(0, "password")
+        self.pass_entry.bind("<FocusIn>", lambda e: self._clear_placeholder(self.pass_entry, "password"))
+        self.pass_entry.grid(row=1, column=0, padx=8, pady=(0, 6))
+
+        self.login_error = ttk.Label(box, text="", foreground="red")
+        self.login_error.grid(row=2, column=0, padx=8, pady=(0, 6))
+
+        login_btn = ttk.Button(box, text="Login", command=self._on_login)
+        login_btn.grid(row=3, column=0, padx=8, pady=(6, 6))
+
+    def _clear_placeholder(self, entry: ttk.Entry, placeholder: str):
+        if entry.get() == placeholder:
+            entry.delete(0, tk.END)
+            if entry is self.pass_entry:
+                entry.config(show="*")
+
+    def _on_login(self):
+        email = self.email_entry.get().strip()
+        password = self.pass_entry.get().strip()
+        row = verify_user(email, password)
+        if row:
+            self.current_user = {
+                "id": row[0],
+                "role": row[1],
+                "skill_index": row[2],
+                "email": email
+            }
+            if row[1] == "admin":
+                redistribute_all_contacts()
+                self.build_admin_screen()
+            else:
+                self.build_user_screen()
+        else:
+            self.login_error.config(text="Invalid email or password")
+
+    # ----------------------------
+    # Shared header/back layout
+    # ----------------------------
+    def _build_header_and_leftpanel_container(self, title_text=""):
+        for w in self.main_frame.winfo_children():
+            w.destroy()
+
+        header = ttk.Frame(self.main_frame)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+
+        # Back button aligned with insert menu (left area)
+        back_btn = ttk.Button(header, text="← Back", command=self.build_login_screen)
+        back_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        title_label = ttk.Label(header, text=title_text, font=("Segoe UI", 14))
+        title_label.grid(row=0, column=1, sticky="w", padx=6)
+
+        # User info in top right corner
+        if self.current_user:
+            user_label = ttk.Label(header, text=f"User: {self.current_user['email']}",
+                                   font=("Segoe UI", 10))
+            user_label.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
+        header.columnconfigure(1, weight=1)
+
+        # Main content area: left insert menu + right table
+        content = ttk.Frame(self.main_frame)
+        content.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # left column for insert/search
+        left_col = ttk.Frame(content)
+        left_col.grid(row=0, column=0, sticky="n", padx=(0, 12))
+
+        # right column for table
+        right_col = ttk.Frame(content)
+        right_col.grid(row=0, column=1, sticky="nsew")
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        return left_col, right_col
+
+    # ----------------------------
+    # Left panel builder (used by admin & user)
+    # ----------------------------
+    # ----------------------------
+    # Left panel builder (used by admin & user)
+    # ----------------------------
+    def build_left_panel(self, parent_frame, allow_edit: bool = False):
+        """
+        allow_edit: если True — это админ (может добавлять); иначе — рабочий (нет кнопки добавления)
+        Поля Name и Phone используются для поиска в реальном времени для обоих ролей.
+        """
+        widgets_frame = ttk.Labelframe(parent_frame, text="Insert Menu", padding=10)
+        widgets_frame.pack(anchor="n", fill="x")
+
+        # Name (search)
+        ttk.Label(widgets_frame, text="Name / Surname").grid(row=0, column=0, sticky="w")
+        self.search_name_var = tk.StringVar()
+        name_entry = ttk.Entry(widgets_frame, textvariable=self.search_name_var, width=28)
+        name_entry.grid(row=1, column=0, pady=(2, 8), sticky="ew")
+        name_entry.bind("<KeyRelease>", lambda e: self.refresh_table())
+
+        # Phone (search)
+        ttk.Label(widgets_frame, text="Phone").grid(row=2, column=0, sticky="w")
+        self.search_phone_var = tk.StringVar()
+        phone_entry = ttk.Entry(widgets_frame, textvariable=self.search_phone_var, width=28)
+        phone_entry.grid(row=3, column=0, pady=(2, 8), sticky="ew")
+        phone_entry.bind("<KeyRelease>", lambda e: self.refresh_table())
+
+        # Separator
+        sep = ttk.Separator(widgets_frame)
+        sep.grid(row=4, column=0, sticky="ew", pady=10)
+
+        # Кнопка "Отправить отчет" только для обычных пользователей
+        if not allow_edit:
+            # Кнопка Отправить отчет с небольшими стилями
+            self.report_btn = ttk.Button(
+                widgets_frame,
+                text="Save to Excel",
+                command=self._save_report_to_excel,
+                style="Accent.TButton"  # Используем твой стиль
+            )
+            self.report_btn.grid(row=5, column=0, pady=(8, 12), sticky="ew", ipady=4)
+
+        else:
+            # Для админа: тема и загрузка Excel
+            def toggle_mode():
+                current = self.style.theme_use()
+                self.style.theme_use("forest-light" if current == "forest-dark" else "forest-dark")
+
+            mode_switch = ttk.Checkbutton(widgets_frame, text="Mode", style="Switch", command=toggle_mode)
+            mode_switch.grid(row=5, column=0, pady=(4, 8), sticky="ew")
+
+        # space for icon placeholder (as requested)
+        icon_placeholder = ttk.Label(widgets_frame, text=" ", width=28)
+        icon_placeholder.grid(row=6, column=0, pady=(6, 0))
+
+        # Buttons area (add / load excel) only for admin
+        if allow_edit:
+            btn_frame = ttk.Frame(widgets_frame)
+            btn_frame.grid(row=7, column=0, pady=(8, 0), sticky="ew")
+            add_btn = ttk.Button(btn_frame, text="Add User", command=self._on_add_user)
+            add_btn.pack(side="left", padx=(0, 8))
+            load_btn = ttk.Button(btn_frame, text="Load Excel", command=self._on_load_excel)
+            load_btn.pack(side="left")
+        return widgets_frame
+    # ----------------------------
+    # Сохранение отчета в Excel
+    # ----------------------------
+    def _save_report_to_excel(self):
+        """Собирает и сохраняет отчет в Excel файл"""
+        if not self.current_user:
+            return
+
+        # Получаем контакты пользователя
+        contacts = load_assigned_contacts_for_user(
+            user_id=self.current_user["id"],
+            filter_name=self.search_name_var.get().strip(),
+            filter_phone=self.search_phone_var.get().strip()
+        )
+
+        # Формируем статистику
+        report_data = {
+            'total_contacts': len(contacts),
+            'answered': 0,
+            'not_answered': 0,
+            'waiting': 0,
+            'no_status': 0,
+            'contacts': []
+        }
+
+        for contact in contacts:
+            status = contact[3] or ''
+            report_data['contacts'].append({
+                'name': contact[1],
+                'phone': contact[2],
+                'status': status
+            })
+
+            if status == 'Answer':
+                report_data['answered'] += 1
+            elif status == 'Don\'t answer':
+                report_data['not_answered'] += 1
+            elif status == 'Waiting':
+                report_data['waiting'] += 1
+            else:
+                report_data['no_status'] += 1
+
+        # Извлекаем имя пользователя из email
+        user_email = self.current_user['email']
+        user_name = user_email.split('@')[0] if '@' in user_email else user_email
+
+        # Сохраняем отчет в Excel
+        success, message = save_report_to_excel(user_email, user_name, report_data)
+
+        if success:
+            messagebox.showinfo(
+                "✅ Save",
+                f"The report was successfully saved to a file:\n{message}\n\n"
+                f"Folder: User_Reports on Desktop"
+            )
+        else:
+            messagebox.showerror("❌ Error", f"Failed to save report:\n{message}")
+
+    # ----------------------------
+    # Table builder & helpers
+    # ----------------------------
+    def build_table(self, parent_frame, allow_edit: bool = False):
+        # Treeview with scrollbar
+        tree_wrapper = ttk.Frame(parent_frame)
+        tree_wrapper.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_wrapper)
+        scrollbar.pack(side="right", fill="y")
+
+        cols = ("id", "name", "phone", "status")
+        self.tree = ttk.Treeview(tree_wrapper, columns=cols, show="headings", yscrollcommand=scrollbar.set)
+        self.tree.heading("name", text="Name")
+        self.tree.heading("phone", text="Phone")
+        self.tree.heading("status", text="Status")
+
+        self.tree.column("id", width=0, stretch=False)  # hide id
+        self.tree.column("name", width=170, anchor="center")
+        self.tree.column("phone", width=180, anchor="center")
+        self.tree.column("status", width=120, anchor="center")
+
+        self.tree.pack(fill="both", expand=True)
+        scrollbar.config(command=self.tree.yview)
+
+        # bind double-click to edit only for admin
+        if allow_edit:
+            self.tree.bind("<Double-1>", self._on_tree_double_click)
+        else:
+            # disable selection editing actions for user (no binding)
+            self.tree.bind("<Double-1>", self._on_worker_double_click)
+
+        # Initial population
+        self.refresh_table()
+
+    def refresh_table(self):
+        for r in self.tree.get_children():
+            self.tree.delete(r)
+
+        name_filter = self.search_name_var.get().strip()
+        phone_filter = self.search_phone_var.get().strip()
+
+        if self.current_user["role"] == "admin":
+            rows = load_contacts_for_admin(
+                filter_name=name_filter,
+                filter_phone=phone_filter
+            )
+        else:
+            rows = load_assigned_contacts_for_user(
+                user_id=self.current_user["id"],
+                filter_name=name_filter,
+                filter_phone=phone_filter
+            )
+
+        for r in rows:
+            self.tree.insert("", tk.END, values=r)
+
+    # ----------------------------
+    # Users table (for admin only)
+    # ----------------------------
+    def build_users_table(self, parent_frame):
+        """Создает таблицу пользователей"""
+        users_frame = ttk.Labelframe(parent_frame, text="Users", padding=10)
+        users_frame.pack(fill="both", expand=True)
+
+        # Treeview для пользователей
+        tree_wrapper = ttk.Frame(users_frame)
+        tree_wrapper.pack(fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(tree_wrapper)
+        scrollbar.pack(side="right", fill="y")
+
+        cols = ("id", "email", "role", "index")
+        self.users_tree = ttk.Treeview(tree_wrapper, columns=cols, show="headings",
+                                       yscrollcommand=scrollbar.set, height=10)
+
+        # Настройка столбцов
+        self.users_tree.heading("id", text="ID")
+        self.users_tree.heading("email", text="Email")
+        self.users_tree.heading("role", text="Role")
+        self.users_tree.heading("index", text="Skill Index")
+
+        self.users_tree.column("id", width=50, anchor="center", minwidth=50)
+        self.users_tree.column("email", width=160, anchor="w", minwidth=160)
+        self.users_tree.column("role", width=60, anchor="center", minwidth=60)
+        self.users_tree.column("index", width=120, anchor="center", minwidth=120)
+
+        self.users_tree.pack(fill="both", expand=True)
+
+        self.users_tree.bind("<Button-3>", self._on_users_right_click)
+        self.users_tree.bind("<Double-1>", self._on_users_double_click)
+
+        scrollbar.config(command=self.users_tree.yview)
+
+        # Загружаем пользователей
+        self.refresh_users_table()
+
+        return users_frame
+
+    def refresh_users_table(self):
+        """Обновляет таблицу пользователей"""
+        if hasattr(self, 'users_tree'):
+            for r in self.users_tree.get_children():
+                self.users_tree.delete(r)
+
+            users = load_all_users()
+            for user in users:
+                user_id, email, role, skill_index = user
+                if skill_index is None:
+                    skill_index = ""
+
+                self.users_tree.insert("", tk.END, values=(user_id, email, role, skill_index))
+
+    # ----------------------------
+    # Admin screen
+    # ----------------------------
+    def build_admin_screen(self):
+        self.root.geometry("1250x354")
+
+        # Используем существующий layout, но добавим третью колонку
+        for w in self.main_frame.winfo_children():
+            w.destroy()
+
+        # Header как в оригинальном коде, но с улучшенным оформлением
+        header = ttk.Frame(self.main_frame)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+
+        # Back button в том же стиле
+        back_btn = ttk.Button(header, text="← Back", command=self.build_login_screen)
+        back_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        # Title с небольшим улучшением
+        title_frame = ttk.Frame(header)
+        title_frame.grid(row=0, column=1, sticky="w", padx=6)
+
+        # Добавляем небольшую декоративную линию перед заголовком
+        separator = ttk.Separator(title_frame, orient="vertical")
+        separator.pack(side="left", fill="y", padx=(0, 8))
+
+        title_label = ttk.Label(title_frame, text="Admin Panel",
+                                font=("Segoe UI", 14))
+        title_label.pack(side="left")
+
+        # User info - делаем его более заметным
+        if self.current_user:
+            user_frame = ttk.Frame(header)
+            user_frame.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
+            # Создаем стилизованную область для информации о пользователе
+            user_container = ttk.Frame(user_frame)
+            user_container.pack()
+
+            # Разделитель между информацией и остальным контентом
+            user_separator = ttk.Separator(user_container, orient="vertical")
+            user_separator.pack(side="left", fill="y", padx=(0, 8))
+
+            # Информация о пользователе в группе
+            user_group = ttk.LabelFrame(user_container, text="User Info",
+                                        padding=(8, 4))
+            user_group.pack(side="left")
+
+            # Отображаем email и роль
+            email_label = ttk.Label(user_group,
+                                    text=f"Email: {self.current_user['email']}",
+                                    font=("Segoe UI", 9))
+            email_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+            role_text = "Administrator" if self.current_user[
+                                               "role"] == "admin" else f"Worker"
+            role_label = ttk.Label(user_group,
+                                   text=f"Role: {role_text}",
+                                   font=("Segoe UI", 9))
+            role_label.grid(row=0, column=1, sticky="w")
+
+        header.columnconfigure(1, weight=1)
+
+        # Main content area: 3 columns
+        content = ttk.Frame(self.main_frame)
+        content.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # left column for insert/search
+        left_col = ttk.Frame(content)
+        left_col.grid(row=0, column=0, sticky="n", padx=(0, 12))
+
+        # middle column for contacts table
+        middle_col = ttk.Frame(content)
+        middle_col.grid(row=0, column=1, sticky="nsew", padx=(0, 12))
+
+        # right column for users table
+        right_col = ttk.Frame(content)
+        right_col.grid(row=0, column=2, sticky="nsew")
+
+        # Настройка весов колонок
+        content.columnconfigure(1, weight=3)  # Контакты занимают больше места
+        content.columnconfigure(2, weight=2)  # Пользователи занимают меньше
+        content.rowconfigure(0, weight=1)
+
+        # Left panel
+        self.build_left_panel(left_col, allow_edit=True)
+
+        # Middle: contacts table
+        contacts_frame = ttk.Labelframe(middle_col, text="Contacts", padding=10)
+        contacts_frame.pack(fill="both", expand=True)
+        self.build_table(contacts_frame, allow_edit=True)
+
+        # Right: users table
+        self.build_users_table(right_col)
+
+    # ----------------------------
+    # User screen
+    # ----------------------------
+    def build_user_screen(self):
+        # Устанавливаем тот же размер окна что и у админа
+        self.root.geometry("800x312")
+
+        # Очищаем основной фрейм
+        for w in self.main_frame.winfo_children():
+            w.destroy()
+
+        # Header
+        header = ttk.Frame(self.main_frame)
+        header.pack(fill="x", padx=12, pady=(12, 0))
+
+        # Back button
+        back_btn = ttk.Button(header, text="← Back", command=self.build_login_screen)
+        back_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+        # Title
+        title_frame = ttk.Frame(header)
+        title_frame.grid(row=0, column=1, sticky="w", padx=6)
+
+        # Декоративная линия
+        separator = ttk.Separator(title_frame, orient="vertical")
+        separator.pack(side="left", fill="y", padx=(0, 8))
+
+        title_label = ttk.Label(title_frame, text="User Panel",
+                                font=("Segoe UI", 14))
+        title_label.pack(side="left")
+
+        # User info - только email
+        if self.current_user:
+            user_frame = ttk.Frame(header)
+            user_frame.grid(row=0, column=2, sticky="e", padx=(0, 12))
+
+            user_container = ttk.Frame(user_frame)
+            user_container.pack()
+
+            # Разделитель
+            user_separator = ttk.Separator(user_container, orient="vertical")
+            user_separator.pack(side="left", fill="y", padx=(0, 8))
+
+            # Информация о пользователе в группе
+            user_group = ttk.LabelFrame(user_container, text="User Info",
+                                        padding=(8, 4))
+            user_group.pack(side="left")
+
+            email_label = ttk.Label(user_group,
+                                    text=f"Email: {self.current_user['email']}",
+                                    font=("Segoe UI", 9))
+            email_label.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+            role_text = "Administrator" if self.current_user[
+                                               "role"] == "admin" else f"Worker"
+            role_label = ttk.Label(user_group,
+                                   text=f"Role: {role_text}",
+                                   font=("Segoe UI", 9))
+            role_label.grid(row=0, column=1, sticky="w")
+
+        header.columnconfigure(1, weight=1)
+
+        # Main content area: 2 columns (без таблицы пользователей)
+        content = ttk.Frame(self.main_frame)
+        content.pack(fill="both", expand=True, padx=12, pady=12)
+
+        # left column for insert/search
+        left_col = ttk.Frame(content)
+        left_col.grid(row=0, column=0, sticky="n", padx=(0, 12))
+
+        # right column for table
+        right_col = ttk.Frame(content)
+        right_col.grid(row=0, column=1, sticky="nsew")
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        # Left panel (без выпадающего списка статусов)
+        self.build_left_panel(left_col, allow_edit=False)
+
+        # Right: contacts table
+        contacts_frame = ttk.Labelframe(right_col, text="My Contacts", padding=10)
+        contacts_frame.pack(fill="both", expand=True)
+        self.build_table(contacts_frame, allow_edit=False)
+
+    # ----------------------------
+    # Admin actions
+    # ----------------------------
+    def _on_add_user(self):
+        win = tk.Toplevel(self.root)
+        win.title("Add User")
+        win.geometry("380x300")
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.grab_set()
+
+        # Центрируем окно относительно родителя
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 210
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 170
+        win.geometry(f"+{x}+{y}")
+
+        # ВНЕШНИЙ ФРЕЙМ (центр)
+        outer = ttk.Frame(win)
+        outer.pack(expand=True)
+
+        # ВНУТРЕННИЙ ФРЕЙМ С ОТСТУПАМИ
+        frame = ttk.Frame(outer, padding=24)
+        frame.pack()
+
+        frame.columnconfigure(0, weight=1)
+
+        # --- Name ---
+        ttk.Label(frame, text="Name Surname").grid(
+            row=0, column=0, pady=(0, 4), sticky="w"
+        )
+        name_var = tk.StringVar()
+        name_entry = ttk.Entry(frame, textvariable=name_var, width=32)
+        name_entry.grid(
+            row=1, column=0, pady=(0, 14), sticky="ew"
+        )
+
+        # --- Email ---
+        ttk.Label(frame, text="Email").grid(
+            row=2, column=0, pady=(0, 4), sticky="w"
+        )
+        email_var = tk.StringVar()
+        email_entry = ttk.Entry(frame, textvariable=email_var, width=32)
+        email_entry.grid(
+            row=3, column=0, pady=(0, 14), sticky="ew"
+        )
+
+        # --- Skill index ---
+        ttk.Label(frame, text="Worker index (1–5)").grid(
+            row=4, column=0, pady=(0, 4), sticky="w"
+        )
+        skill_var = tk.StringVar()
+        skill_combo = ttk.Combobox(
+            frame,
+            textvariable=skill_var,
+            values=["1", "2", "3", "4", "5"],
+            state="readonly",
+            width=30
+        )
+        skill_combo.grid(
+            row=5, column=0, pady=(0, 18), sticky="ew"
+        )
+        skill_combo.current(0)
+
+        # --- Buttons ---
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=6, column=0, sticky="s")
+
+        ttk.Button(btn_frame, text="Back", command=win.destroy).pack(
+            side="right", padx=(8, 0)
+        )
+        ttk.Button(
+            btn_frame,
+            text="Add",
+            command=lambda: self._save_new_user(
+                name_var.get(),
+                email_var.get(),
+                skill_var.get(),
+                win
+            )
+        ).pack(side="left")
+
+    def _save_new_user(self, name: str, email: str, skill: str, dialog: tk.Toplevel):
+        name = name.strip()
+        email = email.strip().lower()
+
+        # --- Name validation ---
+        parts = name.split()
+        if len(parts) != 2 or not all(p.istitle() for p in parts):
+            messagebox.showinfo(
+                "Validation error",
+                "Name must contain Name and Surname,\nboth starting with a capital letter."
+            )
+            return
+
+        expected_email = f"{parts[0].lower()}{parts[1].lower()}@email.com"
+        if email != expected_email:
+            messagebox.showinfo(
+                "Validation error",
+                f"Email does not match Name.\nExpected: {expected_email}"
+            )
+            return
+
+        try:
+            skill_index = int(skill)
+            if not 1 <= skill_index <= 5:
+                raise ValueError
+        except ValueError:
+            messagebox.showinfo("Validation error", "Worker index must be in range 1-5.")
+            return
+
+        # PASSWORD RULE
+        password = email.split("@")[0] + "123"
+
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO users (email, password, role, skill_index)
+                VALUES (?, ?, 'user', ?)
+                """,
+                (email, password, skill_index)
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Error", "User with this email already exists.")
+            return
+
+        redistribute_all_contacts()
+        # Обновляем таблицу пользователей если она существует
+        if hasattr(self, 'users_tree'):
+            self.refresh_users_table()
+        dialog.destroy()
+        messagebox.showinfo(
+            "Success",
+            f"User added successfully.\nPassword: {password}"
+        )
+
+    def _on_load_excel(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Excel file",
+            filetypes=[("Excel files", "*.xlsx *.xlsm")]
+        )
+        if not file_path:
+            return
+
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            sheet = wb.active
+            rows = list(sheet.iter_rows(values_only=True))
+
+            if len(rows) < 2:
+                messagebox.showinfo("Info", "Excel file is empty")
+                return
+
+            headers = [str(h).lower().strip() if h else "" for h in rows[0]]
+
+            phone_idx = None
+            name_idx = None
+            difficulty_idx = None
+
+            for i, h in enumerate(headers):
+                if h in ("phone", "number", "tel", "telephone"):
+                    phone_idx = i
+                if h in ("name", "fullname", "full name"):
+                    name_idx = i
+                if h in ("index", "difficulty", "difficulty_index"):
+                    difficulty_idx = i
+
+            if phone_idx is None:
+                messagebox.showerror("Error", "Phone column not found")
+                return
+            if difficulty_idx is None:
+                messagebox.showerror("Error", "Difficulty index column not found")
+                return
+
+            added, skipped = 0, 0
+
+            for row in rows[1:]:
+                if not row:
+                    continue
+
+                phone_raw = row[phone_idx] if phone_idx < len(row) else ""
+                name_raw = row[name_idx] if name_idx is not None and name_idx < len(row) else ""
+                difficulty_raw = row[difficulty_idx] if difficulty_idx < len(row) else None
+
+                try:
+                    difficulty = int(difficulty_raw)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+
+                phone = normalize_phone(phone_raw)
+                name = (str(name_raw).strip() if name_raw else "")
+
+                if phone == "":
+                    skipped += 1
+                    continue
+
+                if insert_contact_if_not_exists(name, phone, "", difficulty):
+                    added += 1
+                else:
+                    skipped += 1
+
+            redistribute_all_contacts()
+            self.refresh_table()
+            messagebox.showinfo(
+                "Import finished",
+                f"Added: {added}\nSkipped (duplicates/invalid): {skipped}"
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ----------------------------
+    # Tree inline editing (admin)
+    # ----------------------------
+    def _on_tree_double_click(self, event):
+        # identify row/column
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        row_iid = self.tree.identify_row(event.y)
+        col = self.tree.identify_column(event.x)  # e.g. '#2'
+        if not row_iid or not col:
+            return
+        # map column index to column name: '#1' -> id, '#2' -> name, '#3' -> phone, '#4' -> status
+        col_index = int(col.replace("#", ""))
+        col_map = {2: "name", 3: "phone", 4: "status"}
+        if col_index not in col_map:
+            return
+        self._start_edit_cell(row_iid, col_map[col_index])
+
+    def _on_worker_double_click(self, event):
+        row_iid = self.tree.identify_row(event.y)
+        if not row_iid:
+            return
+
+        values = self.tree.item(row_iid, "values")
+        if not values:
+            return
+
+        # contact id is always first column
+        self._selected_contact_id = int(values[0])
+
+        # show context menu at cursor
+        self.status_menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_selected_status(self, status: str):
+        if self._selected_contact_id is None:
+            return
+
+        contact_id = self._selected_contact_id
+
+        # Обновляем статус в базе
+        update_contact_status(contact_id, status)
+
+        # Немедленно обновляем отображение в таблице
+        for item in self.tree.get_children():
+            values = self.tree.item(item, "values")
+            if values and int(values[0]) == contact_id:
+                # Обновляем только статус (четвертый элемент)
+                new_values = (values[0], values[1], values[2], status)
+                self.tree.item(item, values=new_values)
+                break
+
+        self._selected_contact_id = None
+        self.refresh_table()
+
+    def _start_edit_cell(self, item_iid, column_name: str):
+        # get bbox of the cell
+        col_index = {"name": "2", "phone": "3", "status": "4"}[column_name]
+        bbox = self.tree.bbox(item_iid, column=f"#{col_index}")
+        if not bbox:
+            return
+
+        x, y, width, height = bbox
+
+        # make editor wider than cell
+        min_width = 260
+        width = max(width, min_width)
+        min_height = 40
+        height = max(height, min_height)
+
+        # convert tree coords to absolute coords within tree
+        abs_x = self.tree.winfo_rootx() + x
+        abs_y = self.tree.winfo_rooty() + y
+
+        # current value
+        values = self.tree.item(item_iid, "values")
+        col_idx_in_values = {"name": 1, "phone": 2, "status": 3}[column_name]
+        current_val = values[col_idx_in_values] if len(values) > col_idx_in_values else ""
+
+        # create a top-level transparent entry anchored above the tree
+        edit_win = tk.Toplevel(self.root)
+        edit_win.overrideredirect(True)
+        # position at correct place relative to root window
+        rootx = self.root.winfo_rootx()
+        rooty = self.root.winfo_rooty()
+        edit_height = height + 6
+        edit_win.geometry(
+            f"{width}x{height}+{rootx + x + 12}+{rooty + y + 92}")  # small offsets tuned for frame placement
+
+        entry = ttk.Entry(edit_win, font=("Segoe UI", 11))
+        entry.insert(0, current_val)
+        entry.pack(fill="both", expand=True)
+        entry.focus_set()
+
+        def commit(_=None):
+            new_val = entry.get().strip()
+            contact_id = int(values[0])
+            ok, err = update_contact_in_db(contact_id, column_name, new_val)
+            edit_win.destroy()
+            if not ok:
+                messagebox.showerror("Update error", err)
+            self.refresh_table()
+
+        def cancel(_=None):
+            edit_win.destroy()
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", lambda e: cancel())
+
+    def _on_users_right_click(self, event):
+        row_id = self.users_tree.identify_row(event.y)
+        if not row_id:
+            return
+
+        self.users_tree.selection_set(row_id)
+        values = self.users_tree.item(row_id, "values")
+        if not values:
+            return
+
+        user_id, email, role, skill = values
+
+        if role == "admin":
+            return
+
+        self._selected_user_id = int(user_id)
+        self.users_menu.tk_popup(event.x_root, event.y_root)
+
+    def _delete_selected_user(self):
+        if self._selected_user_id is None:
+            return
+
+        if not messagebox.askyesno(
+            "Confirm",
+            "Delete this user and redistribute contacts?"
+        ):
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        cur.execute(
+            "DELETE FROM contact_assignments WHERE user_id = ?",
+            (self._selected_user_id,)
+        )
+
+        cur.execute(
+            "DELETE FROM users WHERE id = ? AND role = 'user'",
+            (self._selected_user_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+        self._selected_user_id = None
+
+        redistribute_all_contacts()
+        self.refresh_users_table()
+        self.refresh_table()
+
+    def _on_users_double_click(self, event):
+        region = self.users_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+
+        row_id = self.users_tree.identify_row(event.y)
+        col = self.users_tree.identify_column(event.x)
+
+        # Skill Index = колонка 4
+        if col != "#4" or not row_id:
+            return
+
+        values = self.users_tree.item(row_id, "values")
+        if not values:
+            return
+
+        user_id, email, role, skill = values
+
+        if role == "admin":
+            return
+
+        self._edit_skill_inline(row_id, int(user_id), skill)
+
+    def _edit_skill_inline(self, row_id, user_id, current_skill):
+        bbox = self.users_tree.bbox(row_id, "#4")
+        if not bbox:
+            return
+
+        x, y, width, height = bbox
+
+        # делаем больше и читабельнее
+        width = max(width, 80)
+        height = max(height, 28)
+
+        skill_var = tk.StringVar(value=str(current_skill))
+
+        combo = ttk.Combobox(
+            self.users_tree,
+            textvariable=skill_var,
+            values=["1", "2", "3", "4", "5"],
+            state="readonly",
+            justify="center",
+            font=("Segoe UI", 11)
+        )
+
+        combo.place(
+            x=x,
+            y=y - 2,
+            width=width,
+            height=height + 6
+        )
+
+        combo.focus_set()
+
+        def save_and_close(event=None):
+            try:
+                new_skill = int(skill_var.get())
+            except ValueError:
+                combo.destroy()
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+
+        def save_and_close(event=None):
+            try:
+                new_skill = int(skill_var.get())
+            except ValueError:
+                combo.destroy()
+                return
+
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE users SET skill_index = ? WHERE id = ?",
+                (new_skill, user_id)
+            )
+            conn.commit()
+            conn.close()
+
+            combo.destroy()
+            redistribute_all_contacts()
+            self.refresh_users_table()
+            self.refresh_table()
+
+        combo.bind("<<ComboboxSelected>>", save_and_close)
+        combo.bind("<Return>", save_and_close)
+        combo.bind("<Escape>", lambda e: combo.destroy())
+        combo.bind("<FocusOut>", lambda e: combo.destroy())
+
+    def _save_skill(self, user_id, skill, win):
+        try:
+            skill = int(skill)
+        except ValueError:
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        cur.execute(
+            "UPDATE users SET skill_index = ? WHERE id = ?",
+            (skill, user_id)
+        )
+
+        conn.commit()
+        conn.close()
+
+        win.destroy()
+
+        redistribute_all_contacts()
+        self.refresh_users_table()
+        self.refresh_table()
+
+
+# ----------------------------
+# Run
+# ----------------------------
+def main():
+    root = tk.Tk()
+    app = App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
